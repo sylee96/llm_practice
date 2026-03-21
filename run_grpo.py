@@ -6,21 +6,15 @@ Dataset: allenai/Dolci-Instruct-RL (Math + IFEval subsets)
 Method:  GRPO with rule-based verifiers as reward (RLVR)
 
 GPU layout:
-  - cuda:0~6  → 7 GPUs for FSDP training
-  - cuda:7    → 1 GPU for vLLM rollout server
-
-Hyperparameters:
-  beta=0.04, num_generations=8, max_completion_length=2048
-  per_device_train_batch_size=8, gradient_accumulation_steps=4
-  num_iterations=3 (steps_per_generation)
-  save_steps=300
+  - cuda:0~6  → 7 GPUs for DDP training
+  - cuda:7    → 1 GPU for vLLM rollout server (via trl.cli vllm-serve)
 
 Usage:
   bash run_grpo.sh
 """
 
-import ast
-import json
+import argparse
+import os
 import torch
 import wandb
 from datasets import load_dataset
@@ -35,7 +29,12 @@ DATASET_ID = "allenai/Dolci-Instruct-RL"
 OUTPUT_DIR = "./qwen3-1.7b-grpo-rlvr-dolci"
 CHAT_TEMPLATE_PATH = "./assets/qwen3_instruct_trl_no_think.jinja"
 
-wandb.init(project="qwen3-grpo", name="qwen3-1.7b-grpo-rlvr-dolci-8gpu")
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--vllm_server_host", type=str, default="localhost")
+    parser.add_argument("--vllm_server_port", type=int, default=8000)
+    return parser.parse_args()
 
 
 # ===================== Dataset =====================
@@ -44,7 +43,14 @@ def prepare_dataset():
     ds = load_dataset(DATASET_ID, split="train")
 
     # Filter: only math and ifeval
-    ds = ds.filter(lambda x: x["dataset"] in ("math", "ifeval"))
+    # dataset column can be a list (e.g., ["math"]) or a string
+    def _is_math_or_ifeval(x):
+        d = x["dataset"]
+        if isinstance(d, list):
+            return any(v in ("math", "ifeval") for v in d)
+        return d in ("math", "ifeval")
+
+    ds = ds.filter(_is_math_or_ifeval)
     print(f"Filtered dataset: {len(ds)} samples")
 
     # Convert prompt field: Dolci uses "prompt" as a string, but also has "source_prompt"
@@ -56,9 +62,14 @@ def prepare_dataset():
             prompt = source_prompt
         else:
             prompt = [{"role": "user", "content": example["prompt"]}]
+        # Flatten dataset field if it's a list
+        ds_val = example["dataset"]
+        if isinstance(ds_val, list):
+            ds_val = ds_val[0] if ds_val else "unknown"
+
         return {
             "prompt": prompt,
-            "dataset": example["dataset"],
+            "dataset": ds_val,
             "ground_truth": example["ground_truth"],
         }
 
@@ -71,6 +82,12 @@ def prepare_dataset():
 
 # ===================== Main =====================
 def main():
+    args = parse_args()
+
+    # wandb: only on main process
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        wandb.init(project="qwen3-grpo", name="qwen3-1.7b-grpo-rlvr-dolci-8gpu")
+
     # 1. Dataset
     ds = prepare_dataset()
 
@@ -91,14 +108,16 @@ def main():
     )
 
     # 4. GRPO Config — RTX PRO 6000 Blackwell × 8
+    #    GPU layout: cuda:6,7 = vLLM (TP=2), cuda:0~5 = DDP training (6 GPUs)
     grpo_config = GRPOConfig(
         output_dir=OUTPUT_DIR,
-        # ── Multi-GPU: 7 train + 1 vLLM ──
-        use_vllm=True,
-        vllm_device="cuda:7",
+        # ── vLLM: external server on GPU 6,7 (TP=2) ──
+        vllm_mode="server",
+        vllm_server_host=args.vllm_server_host,
+        vllm_server_port=args.vllm_server_port,
         vllm_gpu_memory_utilization=0.9,
         # ── Batch & Memory ──
-        per_device_train_batch_size=8,
+        per_device_train_batch_size=16,
         gradient_accumulation_steps=4,
         gradient_checkpointing=True,
         bf16=True,
@@ -106,7 +125,7 @@ def main():
         num_generations=8,
         max_completion_length=2048,
         beta=0.04,
-        num_iterations=3,
+        steps_per_generation=4,
         # ── Generation ──
         temperature=1.0,
         top_p=0.95,

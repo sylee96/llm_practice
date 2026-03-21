@@ -25,6 +25,7 @@ if [ -z "${HF_USERNAME:-}" ]; then
     exit 1
 fi
 
+mkdir -p "$OUTPUT_DIR"
 touch "$UPLOADED_FILE"
 
 echo "[upload_checkpoints] Monitoring ${OUTPUT_DIR} for new checkpoints..."
